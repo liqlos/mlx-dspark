@@ -28,6 +28,16 @@ import time
 
 import mlx.core as mx
 
+from .datastore import (
+    BACKWARD_SCORE_CAP as _DS_BACKWARD_SCORE_CAP,
+    GlobalDatastore,
+    MIN_MATCH_NGRAM as DS_MIN_MATCH_NGRAM,
+    RoundLog,
+    expected_accept_len,
+    should_draft,
+)
+
+_DS_BACKWARD_CONTEXT = _DS_BACKWARD_SCORE_CAP + DS_MIN_MATCH_NGRAM
 from .generate import (
     GenResult,
     _finish_reason,
@@ -163,6 +173,10 @@ def lookup_generate(
     on_prefill=None,
     prefill_marks=None,
     on_prefill_chunk=None,
+    datastore: "GlobalDatastore | None" = None,
+    verify_curve: dict | None = None,
+    round_log: "RoundLog | None" = None,
+    datastore_ingest: bool = True,
 ) -> GenResult:
     """Prompt-lookup speculative decoding (batch=1) — no drafter model.
 
@@ -174,6 +188,18 @@ def lookup_generate(
     ``long_draft_tokens``: match-scaled long-draft ceiling — a deep context match (a real
     copy run) earns drafts up to this length; see :meth:`NGramIndex.propose`. Set equal to
     ``max_draft_tokens`` to disable.
+
+    ``datastore`` (llm-caching NOW.md Phase D1): a persistent, cross-session
+    :class:`~mlx_dspark.datastore.GlobalDatastore` consulted alongside the per-request
+    ``NGramIndex`` every round; the longer-scoring match wins (global preferred on ties,
+    mirroring the per-request source's own recency tie-break). ``verify_curve`` gates
+    drafting on ``E[accepted] + 1 > c(width)`` (no curve = gate disabled, always draft on a
+    match). ``round_log`` records one row per round for offline tuning. This is purely a
+    proposal-source and length policy: with or without a datastore, greedy output is
+    byte-identical (the exactness invariant NOW.md's Phase D1 step 4 requires) — every
+    drafted token still goes through the same target verify as a per-request-only draft.
+    ``datastore_ingest`` feeds this call's own generated output back into ``datastore`` at
+    the end of the request (off for read-only/eval callers).
     """
     if seed is not None:
         mx.random.seed(seed)
@@ -207,9 +233,30 @@ def lookup_generate(
     st.update(out_ids)
     while len(out_ids) < max_new_tokens and pending not in eos_ids and not st.stopped:
         # clamp to the remaining budget: no verify width wasted past max_new_tokens
-        draft = index.propose(
+        local_draft = index.propose(
             long_draft=long_draft_tokens if gate.allowed else None,
-        )[:max_new_tokens - len(out_ids)]
+        )
+        draft, draft_source, match_len, score = local_draft, "lookup", len(local_draft), float(len(local_draft))
+        if datastore is not None and len(index.tokens) >= DS_MIN_MATCH_NGRAM:
+            query_suffix = tuple(index.tokens[-DS_MIN_MATCH_NGRAM:])
+            recent = index.tokens[-(_DS_BACKWARD_CONTEXT):]
+            global_draft, global_score = datastore.match(query_suffix, base_draft, recent)
+            if len(global_draft) >= len(local_draft) and global_draft:
+                draft, draft_source, match_len, score = global_draft, "datastore", len(global_draft), float(global_score)
+        gate_state = "no_match"
+        if draft:
+            gate_state = "drafted" if should_draft(len(draft), score, len(draft), verify_curve) else "gated_off"
+            if gate_state == "gated_off":
+                draft = []
+        draft = draft[:max_new_tokens - len(out_ids)]
+        if round_log is not None:
+            round_log.record(
+                source=draft_source if draft or gate_state == "gated_off" else "plain",
+                match_len=match_len, score=score,
+                predicted_accept=expected_accept_len(match_len, int(score)),
+                drafted=len(draft), accepted=0,  # `accepted` back-filled below once known
+                width=len(draft) or max_draft_tokens, gate_state=gate_state,
+            )
 
         if not draft:
             # no confident match -> plain 1-token step (zero miss cost; verify() with no
@@ -243,11 +290,13 @@ def lookup_generate(
         accept_lengths.append(len(committed))
         if draft:
             gate.update(len(draft), n, base_draft)
+        if round_log is not None:
+            round_log.rows[-1]["accepted"] = n
         if on_round is not None:
             # A miss drafts nothing and costs a plain step; reporting it as such is what makes
             # the lookup hit-rate visible rather than an unexplained throughput swing.
             on_round(drafted=len(draft), accepted=n, committed=len(committed),
-                     cap=len(draft), source="lookup" if draft else "plain")
+                     cap=len(draft), source=draft_source if draft else "plain")
 
         target_model.rollback(cache, len(draft) - n, draft[:n])
 
@@ -261,6 +310,12 @@ def lookup_generate(
         pending = out_ids[-1]        # eos mid-committed ends the loop (not committed[-1])
         st.update(out_ids)
     st.flush()
+    if datastore is not None and datastore_ingest:
+        # feed this request's OWN generated tokens back in, so later requests (this
+        # session's next turn, or another session entirely) can draft from it — this is
+        # the cross-request growth that makes the datastore "global" rather than
+        # per-request (NOW.md: fed by completed responses across requests).
+        datastore.ingest(out_ids)
 
     secs = time.time() - t0
     text = st.text if st.stopped else tokenizer.decode([t for t in out_ids if t not in eos_ids])
