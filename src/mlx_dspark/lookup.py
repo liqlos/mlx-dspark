@@ -195,9 +195,15 @@ def lookup_generate(
     mirroring the per-request source's own recency tie-break). ``verify_curve`` gates
     drafting on ``E[accepted] + 1 > c(width)`` (no curve = gate disabled, always draft on a
     match). ``round_log`` records one row per round for offline tuning. This is purely a
-    proposal-source and length policy: with or without a datastore, greedy output is
-    byte-identical (the exactness invariant NOW.md's Phase D1 step 4 requires) — every
-    drafted token still goes through the same target verify as a per-request-only draft.
+    proposal-source and length policy: every drafted token still goes through the same
+    target verify as a per-request-only draft, so the datastore introduces no new
+    divergence class beyond the fp-tie band the verify path already has (measured on
+    Qwen3-8B-8bit, exactness_gate_v2: every divergence at <=2 bf16 ulps in both arms).
+    It is NOT byte-identical with the datastore off: a datastore hit changes the
+    round's draft width, which changes which near-ties the verify forward lands on,
+    so the exact token sequence with vs without a datastore differs on ~42% of turns
+    even though no divergence is ever large (see NOW.md's Goal invariant, revised
+    2026-09-03).
     ``datastore_ingest`` feeds this call's own generated output back into ``datastore`` at
     the end of the request (off for read-only/eval callers).
     """
